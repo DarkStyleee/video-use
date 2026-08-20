@@ -151,6 +151,43 @@ def is_portrait_source(video: Path) -> bool:
         return False
 
 
+# -------- Vertical reframing (9:16 shorts) ---------------------------------
+#
+# `LIFT_FRACTION` raises the game frame above centre. The band it opens at the
+# bottom is where the platform UI (description, author, action rail) sits on
+# every short-form app, so subtitles placed there stay clear of the gameplay
+# instead of being drawn over it.
+
+VERTICAL_SIZE = (1080, 1920)
+VERTICAL_DRAFT_SIZE = (720, 1280)
+LIFT_FRACTION = 0.123
+
+
+def vertical_filter(draft: bool, portrait_source: bool) -> str:
+    """Filtergraph turning any source into a 9:16 frame.
+
+    A portrait source just fills the canvas. A landscape one is placed above
+    centre over a blurred copy of itself, so nothing is cropped away.
+    """
+    w, h = VERTICAL_DRAFT_SIZE if draft else VERTICAL_SIZE
+
+    if portrait_source:
+        return f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1"
+
+    lift = int(round(h * LIFT_FRACTION))
+    # Blur a downscaled copy: a full-resolution gblur costs far more per frame
+    # and looks the same once it is this out of focus.
+    small_w = max(16, w // 8)
+    return (
+        "split=2[bg][fg];"
+        f"[bg]scale={small_w}:-2,gblur=sigma=6,"
+        f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},"
+        "eq=brightness=-0.30,setsar=1[bgo];"
+        f"[fg]scale={w}:-2:flags=lanczos,setsar=1[fgo];"
+        f"[bgo][fgo]overlay=(W-w)/2:(H-h)/2-{lift}"
+    )
+
+
 # -------- Per-segment extraction (Rule 2 + Rule 3) --------------------------
 
 
@@ -162,6 +199,7 @@ def extract_segment(
     out_path: Path,
     preview: bool = False,
     draft: bool = False,
+    vertical: bool = False,
 ) -> None:
     """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
 
@@ -176,7 +214,9 @@ def extract_segment(
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     portrait = is_portrait_source(source)
-    if draft:
+    if vertical:
+        scale = vertical_filter(draft, portrait)
+    elif draft:
         scale = "scale=-2:1280" if portrait else "scale=1280:-2"
     else:
         scale = "scale=-2:1920" if portrait else "scale=1920:-2"
@@ -231,6 +271,7 @@ def extract_all_segments(
     """
     resolved = resolve_grade_filter(edl.get("grade"))
     is_auto = resolved == "__AUTO__"
+    vertical = bool(edl.get("vertical"))
     clips_dir = edit_dir / (
         "clips_draft" if draft else ("clips_preview" if preview else "clips_graded")
     )
@@ -241,6 +282,9 @@ def extract_all_segments(
 
     seg_paths: list[Path] = []
     print(f"extracting {len(ranges)} segment(s) → {clips_dir.name}/")
+    if vertical:
+        w, h = VERTICAL_DRAFT_SIZE if draft else VERTICAL_SIZE
+        print(f"  (vertical {w}x{h}: full frame above centre over a blurred copy)")
     if is_auto:
         print("  (auto-grade per segment: analyzing each range)")
     for i, r in enumerate(ranges):
@@ -260,7 +304,8 @@ def extract_all_segments(
         print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}")
         if is_auto:
             print(f"        grade: {seg_filter or '(none)'}")
-        extract_segment(src_path, start, duration, seg_filter, out_path, preview=preview, draft=draft)
+        extract_segment(src_path, start, duration, seg_filter, out_path,
+                        preview=preview, draft=draft, vertical=vertical)
         seg_paths.append(out_path)
 
     return seg_paths
