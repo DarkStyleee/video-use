@@ -160,7 +160,11 @@ def is_portrait_source(video: Path) -> bool:
 
 VERTICAL_SIZE = (1080, 1920)
 VERTICAL_DRAFT_SIZE = (720, 1280)
-LIFT_FRACTION = 0.123
+# The block's BOTTOM is pinned, not its centre: a cropped range is taller than
+# a full 16:9 frame, and lifting both from the centre puts their bottom edges
+# in different places — one of them lands on the subtitles.
+BLOCK_BOTTOM_FRACTION = 0.56
+BLOCK_MAX_HEIGHT_FRACTION = 0.55
 
 
 def vertical_filter(draft: bool, portrait_source: bool) -> str:
@@ -174,7 +178,8 @@ def vertical_filter(draft: bool, portrait_source: bool) -> str:
     if portrait_source:
         return f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1"
 
-    lift = int(round(h * LIFT_FRACTION))
+    bottom = int(round(h * BLOCK_BOTTOM_FRACTION))
+    max_block_h = int(round(h * BLOCK_MAX_HEIGHT_FRACTION)) // 2 * 2
     # Blur a downscaled copy: a full-resolution gblur costs far more per frame
     # and looks the same once it is this out of focus.
     small_w = max(16, w // 8)
@@ -183,8 +188,9 @@ def vertical_filter(draft: bool, portrait_source: bool) -> str:
         f"[bg]scale={small_w}:-2,gblur=sigma=6,"
         f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},"
         "eq=brightness=-0.30,setsar=1[bgo];"
-        f"[fg]scale={w}:-2:flags=lanczos,setsar=1[fgo];"
-        f"[bgo][fgo]overlay=(W-w)/2:(H-h)/2-{lift}"
+        f"[fg]scale={w}:{max_block_h}:force_original_aspect_ratio=decrease"
+        ":flags=lanczos,setsar=1[fgo];"
+        f"[bgo][fgo]overlay=(W-w)/2:{bottom}-h"
     )
 
 
@@ -200,6 +206,7 @@ def extract_segment(
     preview: bool = False,
     draft: bool = False,
     vertical: bool = False,
+    crop: dict | None = None,
 ) -> None:
     """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
 
@@ -222,6 +229,13 @@ def extract_segment(
         scale = "scale=-2:1920" if portrait else "scale=1920:-2"
 
     vf_parts: list[str] = []
+    if crop:
+        # Before anything else, so tone mapping and scaling only touch the
+        # pixels that survive. Game UI text shrinks to ~42% in a 9:16 frame
+        # and stops being readable; cropping to the panel is what fixes it.
+        vf_parts.append(
+            f"crop={int(crop['w'])}:{int(crop['h'])}:{int(crop['x'])}:{int(crop['y'])}"
+        )
     if is_hdr_source(source):
         vf_parts.append(TONEMAP_CHAIN)
     vf_parts.append(scale)
@@ -301,11 +315,16 @@ def extract_all_segments(
             seg_filter = resolved
 
         note = r.get("beat") or r.get("note") or ""
-        print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}")
+        crop_note = ""
+        if r.get("crop"):
+            c = r["crop"]
+            crop_note = f"  crop {int(c['w'])}x{int(c['h'])}+{int(c['x'])}+{int(c['y'])}"
+        print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}{crop_note}")
         if is_auto:
             print(f"        grade: {seg_filter or '(none)'}")
         extract_segment(src_path, start, duration, seg_filter, out_path,
-                        preview=preview, draft=draft, vertical=vertical)
+                        preview=preview, draft=draft, vertical=vertical,
+                        crop=r.get("crop"))
         seg_paths.append(out_path)
 
     return seg_paths
