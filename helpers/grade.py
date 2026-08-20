@@ -29,10 +29,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
+
+# Windows consoles/pipes default to cp1251; these scripts print arrows and math symbols.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 
 PRESETS: dict[str, str] = {
@@ -93,86 +98,83 @@ def _sample_frame_stats(
           "sat_mean": mean saturation in 0..1,
         }
     """
-    # Use signalstats + metadata=print to get per-frame stats
     # Sample fps = n_samples / duration, clamped so we don't over-sample short clips
     fps = max(0.5, min(n_samples / max(duration, 0.1), 10.0))
 
-    with tempfile.NamedTemporaryFile(mode="w+", suffix=".txt", delete=False) as f:
-        metadata_path = f.name
+    # `file=-` sends the metadata to stdout. Writing it to a temp file instead
+    # would put a filesystem path inside a filter option value, and a Windows
+    # drive colon there splits the option list.
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-nostats",
+        "-ss", f"{start:.3f}",
+        "-i", str(video),
+        "-t", f"{duration:.3f}",
+        "-vf", f"fps={fps:.2f},signalstats,metadata=print:file=-",
+        "-f", "null", os.devnull,
+    ]
+    proc = subprocess.run(
+        cmd, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", check=True,
+    )
 
-    try:
-        cmd = [
-            "ffmpeg", "-y", "-hide_banner", "-nostats",
-            "-ss", f"{start:.3f}",
-            "-i", str(video),
-            "-t", f"{duration:.3f}",
-            "-vf", f"fps={fps:.2f},signalstats,metadata=print:file={metadata_path}",
-            "-f", "null", "-",
-        ]
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # Signalstats reports values in the NATIVE bit depth of the decoded frame
+    # (8-bit -> 0-255, 10-bit -> 0-1023). We read YBITDEPTH and normalize by
+    # (2^depth - 1) so downstream math is in 0..1 regardless of source bit depth.
+    y_avgs: list[float] = []
+    y_mins: list[float] = []
+    y_maxs: list[float] = []
+    sat_avgs: list[float] = []
+    bit_depth: int = 8
 
-        # Parse signalstats metadata. Signalstats reports values in the NATIVE
-        # bit depth of the decoded frame (8-bit → 0-255, 10-bit → 0-1023). We
-        # read YBITDEPTH and normalize by (2^depth - 1) so downstream math is
-        # in 0..1 regardless of source bit depth.
-        y_avgs: list[float] = []
-        y_mins: list[float] = []
-        y_maxs: list[float] = []
-        sat_avgs: list[float] = []
-        bit_depth: int = 8
+    def _parse_value(line: str) -> float | None:
+        try:
+            return float(line.rsplit("=", 1)[1])
+        except (ValueError, IndexError):
+            return None
 
-        def _parse_value(line: str) -> float | None:
-            try:
-                return float(line.rsplit("=", 1)[1])
-            except (ValueError, IndexError):
-                return None
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if "lavfi.signalstats.YBITDEPTH" in line:
+            v = _parse_value(line)
+            if v is not None:
+                bit_depth = int(v)
+        elif "lavfi.signalstats.YAVG" in line:
+            v = _parse_value(line)
+            if v is not None:
+                y_avgs.append(v)
+        elif "lavfi.signalstats.YMIN" in line:
+            v = _parse_value(line)
+            if v is not None:
+                y_mins.append(v)
+        elif "lavfi.signalstats.YMAX" in line:
+            v = _parse_value(line)
+            if v is not None:
+                y_maxs.append(v)
+        elif "lavfi.signalstats.SATAVG" in line:
+            v = _parse_value(line)
+            if v is not None:
+                sat_avgs.append(v)
 
-        with open(metadata_path) as f:
-            for line in f:
-                line = line.strip()
-                if "lavfi.signalstats.YBITDEPTH" in line:
-                    v = _parse_value(line)
-                    if v is not None:
-                        bit_depth = int(v)
-                elif "lavfi.signalstats.YAVG" in line:
-                    v = _parse_value(line)
-                    if v is not None:
-                        y_avgs.append(v)
-                elif "lavfi.signalstats.YMIN" in line:
-                    v = _parse_value(line)
-                    if v is not None:
-                        y_mins.append(v)
-                elif "lavfi.signalstats.YMAX" in line:
-                    v = _parse_value(line)
-                    if v is not None:
-                        y_maxs.append(v)
-                elif "lavfi.signalstats.SATAVG" in line:
-                    v = _parse_value(line)
-                    if v is not None:
-                        sat_avgs.append(v)
+    if not y_avgs:
+        # Analysis failed - return neutral defaults (no correction)
+        return {"y_mean": 0.5, "y_std": 0.18, "sat_mean": 0.25}
 
-        if not y_avgs:
-            # Analysis failed — return neutral defaults (no correction)
-            return {"y_mean": 0.5, "y_std": 0.18, "sat_mean": 0.25}
+    # Normalize by native bit-depth max value
+    max_val = (2 ** bit_depth) - 1
 
-        # Normalize by native bit-depth max value
-        max_val = (2 ** bit_depth) - 1
+    y_mean = (sum(y_avgs) / len(y_avgs)) / max_val
+    y_range = (
+        ((sum(y_maxs) / len(y_maxs)) - (sum(y_mins) / len(y_mins))) / max_val
+        if y_maxs and y_mins
+        else 0.7
+    )
+    sat_mean = ((sum(sat_avgs) / len(sat_avgs)) / max_val) if sat_avgs else 0.25
 
-        y_mean = (sum(y_avgs) / len(y_avgs)) / max_val
-        y_range = (
-            ((sum(y_maxs) / len(y_maxs)) - (sum(y_mins) / len(y_mins))) / max_val
-            if y_maxs and y_mins
-            else 0.7
-        )
-        sat_mean = ((sum(sat_avgs) / len(sat_avgs)) / max_val) if sat_avgs else 0.25
-
-        return {
-            "y_mean": y_mean,
-            "y_std": y_range / 4.0,  # range ÷ 4 ≈ stddev for normal-ish distributions
-            "sat_mean": sat_mean,
-        }
-    finally:
-        Path(metadata_path).unlink(missing_ok=True)
+    return {
+        "y_mean": y_mean,
+        "y_std": y_range / 4.0,  # range / 4 ~ stddev for normal-ish distributions
+        "sat_mean": sat_mean,
+    }
 
 
 def auto_grade_for_clip(

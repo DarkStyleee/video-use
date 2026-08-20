@@ -20,6 +20,11 @@ import json
 import sys
 from pathlib import Path
 
+# Windows consoles/pipes default to cp1251; these scripts print arrows and math symbols.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 
 def format_time(seconds: float) -> str:
     """Format a time in seconds as "NNN.NN" with fixed 6-char width for alignment."""
