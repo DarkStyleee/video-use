@@ -498,22 +498,74 @@ def apply_loudnorm_two_pass(
 # -------- Final compositing (Rule 1 + Rule 4) -------------------------------
 
 
+# Ducking defaults. sidechaincompress squashes the source audio whenever the
+# voiceover is above `threshold`, so speech stays intelligible over gameplay
+# without anyone riding a fader. Attack is fast enough not to clip the first
+# word; release is slow enough not to pump between words in a sentence.
+DUCK_THRESHOLD = 0.01
+DUCK_RATIO = 15
+DUCK_ATTACK_MS = 20
+DUCK_RELEASE_MS = 300
+
+
+def build_voiceover_audio_graph(
+    vo_index: int,
+    voiceover: dict,
+) -> tuple[list[str], str]:
+    """Return (filter_parts, out_label) mixing a voiceover over the base audio.
+
+    Input [0:a] is the concatenated source audio, [vo_index:a] the narration.
+    With ducking on, the source is compressed by the voice via sidechaincompress
+    and the two are mixed. With ducking off, the voice replaces the source.
+    """
+    delay_ms = int(round(float(voiceover.get("start_in_output", 0.0)) * 1000))
+    fmt = "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"
+
+    parts: list[str] = [f"[{vo_index}:a]{fmt}[vo_raw]"]
+    if delay_ms > 0:
+        parts.append(f"[vo_raw]adelay={delay_ms}|{delay_ms}[vo]")
+    else:
+        parts.append("[vo_raw]anull[vo]")
+
+    if not voiceover.get("duck", True):
+        # Voice replaces the source audio outright.
+        return parts, "[vo]"
+
+    threshold = float(voiceover.get("duck_threshold", DUCK_THRESHOLD))
+    ratio = float(voiceover.get("duck_ratio", DUCK_RATIO))
+
+    parts.append(f"[0:a]{fmt}[src]")
+    # The voice is needed twice: once as the sidechain key, once in the mix.
+    parts.append("[vo]asplit=2[vo_key][vo_mix]")
+    parts.append(
+        f"[src][vo_key]sidechaincompress="
+        f"threshold={threshold}:ratio={ratio}:"
+        f"attack={DUCK_ATTACK_MS}:release={DUCK_RELEASE_MS}[ducked]"
+    )
+    # normalize=0 matters: amix otherwise divides every input by the input
+    # count and the whole mix drops 6 dB.
+    parts.append("[ducked][vo_mix]amix=inputs=2:duration=first:normalize=0[aout]")
+    return parts, "[aout]"
+
+
 def build_final_composite(
     base_path: Path,
     overlays: list[dict],
     subtitles_path: Path | None,
     out_path: Path,
     edit_dir: Path,
+    voiceover: dict | None = None,
 ) -> None:
-    """Final pass: base → overlays (PTS-shifted) → subtitles LAST → out.
+    """Final pass: base -> overlays (PTS-shifted) -> subtitles LAST -> out.
 
-    If there are no overlays and no subtitles, just copy base to out.
+    If there are no overlays, no subtitles and no voiceover, just copy base.
     """
     has_overlays = bool(overlays)
     has_subs = subtitles_path is not None and subtitles_path.exists()
+    has_vo = bool(voiceover)
 
-    if not has_overlays and not has_subs:
-        # Nothing to do — just rename/copy base to final name
+    if not has_overlays and not has_subs and not has_vo:
+        # Nothing to do - just rename/copy base to final name
         run(["ffmpeg", "-y", "-i", str(base_path), "-c", "copy", str(out_path)], quiet=True)
         return
 
@@ -521,6 +573,13 @@ def build_final_composite(
     for ov in overlays:
         ov_path = resolve_path(ov["file"], edit_dir)
         inputs += ["-i", str(ov_path)]
+
+    vo_index = 1 + len(overlays)
+    if has_vo:
+        vo_path = resolve_path(voiceover["file"], edit_dir)
+        if not vo_path.exists():
+            sys.exit(f"voiceover file not found: {vo_path}")
+        inputs += ["-i", str(vo_path)]
 
     filter_parts: list[str] = []
     # PTS-shift every overlay so its frame 0 lands at start_in_output
@@ -540,7 +599,7 @@ def build_final_composite(
         )
         current = next_label
 
-    # Subtitles LAST — Rule 1
+    # Subtitles LAST - Rule 1
     if has_subs:
         subs_abs = subtitles_path.resolve().as_posix().replace(":", r"\:").replace("'", r"\'")
         filter_parts.append(
@@ -553,7 +612,19 @@ def build_final_composite(
             filter_parts.append(f"{current}null[outv]")
             out_label = "[outv]"
         else:
-            out_label = "[0:v]"
+            # No video filters ran: map the input stream directly. Brackets
+            # would make ffmpeg look for a filtergraph output by that name.
+            out_label = "0:v"
+
+    # Audio: voiceover mixed over (or replacing) the source audio
+    if has_vo:
+        audio_parts, audio_label = build_voiceover_audio_graph(vo_index, voiceover)
+        filter_parts += audio_parts
+        audio_map = [audio_label]
+        audio_codec = ["-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
+    else:
+        audio_map = ["0:a"]
+        audio_codec = ["-c:a", "copy"]
 
     filter_complex = ";".join(filter_parts)
 
@@ -562,15 +633,16 @@ def build_final_composite(
         *inputs,
         "-filter_complex", filter_complex,
         "-map", out_label,
-        "-map", "0:a",
+        "-map", audio_map[0],
         "-c:v", "libx264", "-preset", "fast", "-crf", "18",
         "-pix_fmt", "yuv420p",
-        "-c:a", "copy",
+        *audio_codec,
         "-movflags", "+faststart",
         str(out_path),
     ]
-    print(f"compositing → {out_path.name}")
-    print(f"  overlays: {len(overlays)}, subtitles: {'yes' if has_subs else 'no'}")
+    print(f"compositing -> {out_path.name}")
+    print(f"  overlays: {len(overlays)}, subtitles: {'yes' if has_subs else 'no'}, "
+          f"voiceover: {'ducked' if has_vo and voiceover.get('duck', True) else ('replace' if has_vo else 'no')}")
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
@@ -645,13 +717,14 @@ def main() -> None:
 
     # 4. Composite (overlays + subtitles LAST) → intermediate (pre-loudnorm) path
     overlays = edl.get("overlays") or []
+    voiceover = edl.get("voiceover")
     if args.no_loudnorm:
         # Composite directly to final output
-        build_final_composite(base_path, overlays, subs_path, out_path, edit_dir)
+        build_final_composite(base_path, overlays, subs_path, out_path, edit_dir, voiceover)
     else:
         # Composite to a temp file, then run loudnorm → final output
         tmp_composite = out_path.with_suffix(".prenorm.mp4")
-        build_final_composite(base_path, overlays, subs_path, tmp_composite, edit_dir)
+        build_final_composite(base_path, overlays, subs_path, tmp_composite, edit_dir, voiceover)
         print("loudness normalization → social-ready (-14 LUFS / -1 dBTP / LRA 11)")
         apply_loudnorm_two_pass(tmp_composite, out_path, preview=args.draft)
         tmp_composite.unlink(missing_ok=True)
