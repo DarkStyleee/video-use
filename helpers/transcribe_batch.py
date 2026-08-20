@@ -61,6 +61,12 @@ def main() -> None:
         default=None,
         help="Optional number of speakers. Improves diarization when known.",
     )
+    ap.add_argument(
+        "--audio-track",
+        type=int,
+        default=0,
+        help="Zero-based audio track to transcribe (OBS: 0 = game, 1 = mic).",
+    )
     args = ap.parse_args()
 
     videos_dir = args.videos_dir.resolve()
@@ -98,6 +104,7 @@ def main() -> None:
                 language=args.language,
                 num_speakers=args.num_speakers,
                 verbose=False,
+                audio_track=args.audio_track,
             ): v
             for v in pending
         }
